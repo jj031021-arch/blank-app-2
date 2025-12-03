@@ -1,237 +1,411 @@
 import streamlit as st
 import pandas as pd
 import requests
-import folium
-from folium.plugins import HeatMap
-from streamlit_folium import st_folium
+import pydeck as pdk
+import time
 
-# ==============================
-# 🔴 여기만 네 API 키로 바꾸면 됨
-# ==============================
-API_KEY = "여기에_당신의_구글_API_키_붙여넣기"
+# -----------------------------
+# 0. 기본 설정 & 상수
+# -----------------------------
+st.set_page_config(page_title="Berlin Trip Planner", layout="wide")
+
+GOOGLE_API_KEY = st.secrets["GOOGLE_MAPS_API_KEY"]
+FX_API_BASE_URL = st.secrets.get("FX_API_BASE_URL", "https://api.frankfurter.app/latest")
+HOME_CURRENCY = st.secrets.get("HOME_CURRENCY", "KRW")
+
+BERLIN_CENTER = {"lat": 52.5200, "lon": 13.4050}
 
 
-# ------------------------------
-# Google Places API로 장소 가져오기
-# ------------------------------
-def get_places(query, min_rating=None):
+# -----------------------------
+# 1. 유틸 함수들
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def get_exchange_rate(base="EUR", target=HOME_CURRENCY):
+    """EUR -> KRW 같은 환율 가져오기 (단순 예시)"""
+    try:
+        url = f"{FX_API_BASE_URL}?from={base}&to={target}"
+        res = requests.get(url)
+        res.raise_for_status()
+        data = res.json()
+        rate = data["rates"][target]
+        return rate
+    except Exception as e:
+        st.error(f"환율 API 에러: {e}")
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def get_weather_berlin():
     """
-    query 예시:
-     - 'restaurants in Berlin'
-     - 'tourist attractions in Berlin'
-     - 'hotels in Berlin'
+    Google Maps Weather API - currentConditions 사용해서
+    베를린 현재 날씨 가져오기.
+    https://weather.googleapis.com/v1/currentConditions:lookup 
     """
-    url = (
-        "https://maps.googleapis.com/maps/api/place/textsearch/json"
-        f"?query={query}&key={API_KEY}"
-    )
-    response = requests.get(url).json()
+    try:
+        url = "https://weather.googleapis.com/v1/currentConditions:lookup"
+        params = {
+            "key": GOOGLE_API_KEY,
+            "location.latitude": BERLIN_CENTER["lat"],
+            "location.longitude": BERLIN_CENTER["lon"],
+            "unitsSystem": "METRIC",  # 섭씨 기준
+        }
+        res = requests.get(url, params=params)
+        res.raise_for_status()
+        data = res.json()
+        # currentConditions 객체 하나가 온다고 가정
+        current = data.get("currentConditions", {})
+        return current, data  # 요약용 + 원본 JSON 같이 반환
+    except Exception as e:
+        st.error(f"날씨 API 에러: {e}")
+        return None, None
 
-    results = []
-    for place in response.get("results", []):
-        geometry = place.get("geometry", {})
-        location = geometry.get("location", {})
-        lat = location.get("lat")
-        lng = location.get("lng")
-        rating = place.get("rating")
 
-        # 평점 필터 (예: 4.5 이상)
-        if min_rating is not None:
-            if rating is None or rating < min_rating:
-                continue
+@st.cache_data(show_spinner=False)
+def google_places_text_search(query, api_key=GOOGLE_API_KEY):
+    """
+    Google Places Text Search API 호출.
+    query 예: 'restaurants in Berlin, Germany'
+    """
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": query,
+        "key": api_key,
+    }
+    all_results = []
 
-        if lat is None or lng is None:
-            continue
+    while True:
+        res = requests.get(url, params=params)
+        res.raise_for_status()
+        data = res.json()
+        results = data.get("results", [])
+        all_results.extend(results)
 
-        results.append(
+        next_token = data.get("next_page_token")
+        if not next_token:
+            break
+
+        # 다음 페이지 토큰 활성화까지 약간 딜레이 필요
+        time.sleep(2)
+        params = {"pagetoken": next_token, "key": api_key}
+
+    return all_results
+
+
+def places_to_df(places, category_label):
+    """Google Places 결과를 위도/경도 DataFrame으로 변환"""
+    rows = []
+    for p in places:
+        loc = p["geometry"]["location"]
+        rating = p.get("rating", 0)
+        rows.append(
             {
-                "name": place.get("name"),
-                "address": place.get("formatted_address"),
-                "lat": lat,
-                "lng": lng,
+                "name": p.get("name"),
+                "lat": loc["lat"],
+                "lon": loc["lng"],
                 "rating": rating,
+                "address": p.get("formatted_address"),
+                "category": category_label,
             }
         )
+    return pd.DataFrame(rows)
 
-    return pd.DataFrame(results)
 
-
-# ------------------------------
-# Geocoding (주소 → 위도/경도)
-# ------------------------------
-@st.cache_data
-def geocode(address: str):
-    params = {"address": address, "key": API_KEY}
+@st.cache_data(show_spinner=False)
+def geocode_location(location_name):
+    """
+    지명(예: 범죄 데이터 Location)을 lat/lon으로 지오코딩.
+    Google Geocoding API 사용.
+    """
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    res = requests.get(url, params=params).json()
-    if res.get("status") == "OK":
-        loc = res["results"][0]["geometry"]["location"]
+    params = {
+        "address": f"{location_name}, Berlin, Germany",
+        "key": GOOGLE_API_KEY,
+    }
+    res = requests.get(url, params=params)
+    res.raise_for_status()
+    data = res.json()
+    if data.get("results"):
+        loc = data["results"][0]["geometry"]["location"]
         return loc["lat"], loc["lng"]
     else:
         return None, None
 
 
-# ------------------------------
-# 범죄 데이터 불러오기
-# ------------------------------
-@st.cache_data
-def load_crime_data():
-    # 같은 폴더에 있는 Berlin_crimes.csv 사용
+@st.cache_data(show_spinner=False)
+def load_and_prepare_crime_data():
+    """
+    Berlin_crimes.csv 사용해서
+    - 최신 Year만 사용
+    - Location을 지오코딩해서 lat/lon 추가
+    - crime_total, risk_norm(0~1) 계산
+    """
     df = pd.read_csv("Berlin_crimes.csv")
-    return df
+
+    # Year, District, Code, Location 제외 나머지를 범죄 건수로 보고 합산
+    crime_columns = [
+        c for c in df.columns
+        if c not in ["Year", "District", "Code", "Location"]
+    ]
+    df["crime_total"] = df[crime_columns].sum(axis=1)
+
+    latest_year = df["Year"].max()
+    df_latest = df[df["Year"] == latest_year].copy()
+
+    lats = []
+    lons = []
+    for loc_name in df_latest["Location"]:
+        lat, lon = geocode_location(loc_name)
+        lats.append(lat)
+        lons.append(lon)
+
+    df_latest["lat"] = lats
+    df_latest["lon"] = lons
+
+    # 지오코딩 실패한 행 제거
+    df_latest = df_latest.dropna(subset=["lat", "lon"])
+
+    # 범죄 위험도 정규화 (0~1)
+    max_crime = df_latest["crime_total"].max()
+    if max_crime > 0:
+        df_latest["risk_norm"] = df_latest["crime_total"] / max_crime
+    else:
+        df_latest["risk_norm"] = 0.0
+
+    return df_latest
 
 
-# ------------------------------
-# 범죄 Heatmap 만들기 (Location 컬럼 이용해서 Geocoding)
-# ------------------------------
-def add_crime_heatmap(fmap, crime_df):
-    heat_data = []
-
-    # Location 단위로 그룹화 (같은 지역 여러 행 -> 합치기)
-    grouped = crime_df.groupby("Location")
-
-    for location_name, group in grouped:
-        # 예: "Alexanderplatz, Berlin, Germany"
-        query = f"{location_name}, Berlin, Germany"
-        lat, lng = geocode(query)
-        if lat is None or lng is None:
-            continue
-
-        # 범죄 정도를 weight로 사용 (여기서는 Local 컬럼 합)
-        if "Local" in group.columns:
-            weight = group["Local"].sum()
-        else:
-            # Local이 없으면 1로 두고 단순 위치만 표시
-            weight = 1
-
-        heat_data.append([lat, lng, float(weight)])
-
-    if heat_data:
-        HeatMap(heat_data, radius=25, blur=15, max_zoom=13).add_to(fmap)
+# -----------------------------
+# 2. 사이드바 & 페이지 선택
+# -----------------------------
+st.sidebar.title("Berlin Trip Planner")
+page = st.sidebar.radio("페이지 선택", ["환율 & 날씨", "지도"])
 
 
-# ------------------------------
-# Streamlit 앱 시작
-# ------------------------------
-def main():
-    st.set_page_config(page_title="베를린 여행 & 범죄 위험도 지도", layout="wide")
-    st.title("🇩🇪 베를린 여행 지도 + 범죄 위험도")
+# -----------------------------
+# 3. 환율 & 날씨 페이지
+# -----------------------------
+if page == "환율 & 날씨":
+    st.title("베를린 여행 준비: 환율 & 날씨")
 
-    st.write("구글 지도 + 범죄 데이터 + 나만의 맛집을 표시하는 대시보드입니다.")
+    # 환율
+    st.subheader("환율 정보")
+    rate = get_exchange_rate("EUR", HOME_CURRENCY)
+    if rate:
+        st.write(f"1 EUR ≈ **{rate:.2f} {HOME_CURRENCY}**")
+    else:
+        st.write("환율 정보를 불러올 수 없습니다 😢")
 
-    # 사이드바 필터
-    st.sidebar.header("필터")
-    show_restaurants = st.sidebar.checkbox("🍽️ 음식점 (4.5★ 이상)", value=True)
-    show_hotels = st.sidebar.checkbox("🏨 숙박 시설(호텔)", value=True)
-    show_attractions = st.sidebar.checkbox("📍 관광지 (4.5★ 이상)", value=True)
-    show_crime = st.sidebar.checkbox("🚨 범죄 위험도 Heatmap", value=True)
+    # 날씨 (Google Weather API)
+    st.subheader("베를린 현재 날씨 (Google Weather API)")
 
-    # 데이터 로드 (API 호출)
-    st.sidebar.write("데이터 불러오는 중...")
+    weather, weather_raw = get_weather_berlin()
+    if weather:
+        # temperature, apparentTemperature, relativeHumidity 정도만 사용
+        temp = weather.get("temperature")
+        feels = weather.get("apparentTemperature")
+        humidity = weather.get("relativeHumidity")
+        # 설명 텍스트 필드는 실제 응답 구조 보고 조정 필요
+        # (conditionCode, weatherCondition 등)
+        condition_code = weather.get("weatherCondition", {}).get("text") \
+            if isinstance(weather.get("weatherCondition"), dict) else None
 
-    # 평점 조건:
-    # - 음식점: 4.5 이상
-    # - 관광지: 4.5 이상
-    # - 호텔: 평점 필터 X 또는 4.0 이상 등으로 자유롭게 조정 가능
-    restaurants = pd.DataFrame()
-    hotels = pd.DataFrame()
-    attractions = pd.DataFrame()
+        if condition_code:
+            st.write(f"날씨: **{condition_code}**")
+        st.write(f"현재 기온: **{temp}°C**")
+        if feels is not None:
+            st.write(f"체감 기온: **{feels}°C**")
+        if humidity is not None:
+            st.write(f"습도: **{humidity}%**")
 
-    if show_restaurants:
-        restaurants = get_places("restaurants in Berlin, Germany", min_rating=4.5)
+        with st.expander("원시 날씨 JSON 보기 (필드 구조 확인용)"):
+            st.json(weather_raw)
+    else:
+        st.write("날씨 정보를 불러올 수 없습니다 😢")
 
-    if show_hotels:
-        hotels = get_places("hotels in Berlin, Germany", min_rating=None)
 
-    if show_attractions:
-        attractions = get_places("tourist attractions in Berlin, Germany", min_rating=4.5)
+# -----------------------------
+# 4. 지도 페이지
+# -----------------------------
+else:
+    st.title("베를린 여행 지도 (맛집/숙소/관광지 + 범죄 히트맵)")
 
-    crime_df = load_crime_data()
+    # --- 유저가 직접 추가한 장소를 저장하기 위한 session_state ---
+    if "user_places" not in st.session_state:
+        st.session_state["user_places"] = []
 
-    # 사용자 커스텀 장소 저장용
-    if "custom_places" not in st.session_state:
-        st.session_state["custom_places"] = []
+    with st.sidebar.expander("지도 옵션", expanded=True):
+        show_restaurants = st.checkbox("음식점 보기", value=True)
+        show_hotels = st.checkbox("숙박시설 보기", value=True)
+        show_attractions = st.checkbox("관광지 보기", value=True)
+        show_crime = st.checkbox("범죄 위험도 히트맵 보기", value=True)
 
-    # --------------------------
-    # 사용자 직접 장소 추가 폼
-    # --------------------------
-    st.subheader("📝 나만의 맛집 / 장소 추가하기")
+    st.markdown("### 1) 구글 맵에서 베를린 장소 가져오기 (평점 4.5 이상 음식점)")
 
-    with st.form("add_place_form"):
-        custom_name = st.text_input("장소 이름 (예: 나만의 맛집)")
-        custom_address = st.text_input("주소 (Google Maps에 나오는 형태로)")
+    if st.button("데이터 불러오기 / 새로고침"):
+        with st.spinner("Google Places 에서 장소를 불러오는 중입니다..."):
+            # 음식점 (rating 4.5 이상 필터)
+            places_rest = google_places_text_search("restaurants in Berlin, Germany")
+            df_rest = places_to_df(places_rest, "restaurant")
+            df_rest = df_rest[df_rest["rating"] >= 4.5]
+
+            # 숙박시설
+            places_hotels = google_places_text_search("hotels in Berlin, Germany")
+            df_hotels = places_to_df(places_hotels, "hotel")
+
+            # 관광지
+            places_attr = google_places_text_search("tourist attractions in Berlin, Germany")
+            df_attr = places_to_df(places_attr, "attraction")
+
+            st.session_state["df_rest"] = df_rest
+            st.session_state["df_hotels"] = df_hotels
+            st.session_state["df_attr"] = df_attr
+
+            st.success("장소 데이터를 불러왔습니다!")
+
+    # session_state 에서 데이터 가져오기
+    df_rest = st.session_state.get("df_rest", pd.DataFrame())
+    df_hotels = st.session_state.get("df_hotels", pd.DataFrame())
+    df_attr = st.session_state.get("df_attr", pd.DataFrame())
+
+    # 간단한 표로 확인
+    with st.expander("가져온 데이터 미리보기"):
+        st.write("🍽 음식점 (rating 4.5+)", df_rest.head())
+        st.write("🏨 숙박시설", df_hotels.head())
+        st.write("🎡 관광지", df_attr.head())
+
+    st.markdown("### 2) 나만의 장소 추가하기 (주소 직접 입력)")
+
+    with st.form("user_place_form"):
+        place_name = st.text_input("장소 이름 (예: 나만의 맛집)")
+        place_category = st.selectbox("카테고리", ["restaurant", "hotel", "attraction"])
+        place_address = st.text_input("주소 (영어로 입력하면 지오코딩이 잘 됩니다)")
         submitted = st.form_submit_button("지도에 추가")
 
-    if submitted:
-        if custom_address.strip() == "":
-            st.error("주소를 입력해주세요.")
-        else:
-            # 주소를 베를린 기준으로 해석하고 싶다면 ", Berlin, Germany"를 뒤에 붙여도 됨
-            full_address = custom_address  # + ", Berlin, Germany"
-            lat, lng = geocode(full_address)
-            if lat is None:
-                st.error("주소를 찾을 수 없습니다. 구글 지도에 있는 정확한 주소를 넣어보세요.")
-            else:
-                st.success(f"'{custom_name or custom_address}' 을(를) 지도에 추가했습니다.")
-                st.session_state["custom_places"].append(
-                    {
-                        "name": custom_name or custom_address,
-                        "lat": lat,
-                        "lng": lng,
+        if submitted and place_name and place_address:
+            try:
+                url = "https://maps.googleapis.com/maps/api/geocode/json"
+                params = {
+                    "address": place_address,
+                    "key": GOOGLE_API_KEY,
+                }
+                res = requests.get(url, params=params)
+                res.raise_for_status()
+                data = res.json()
+                if data.get("results"):
+                    loc = data["results"][0]["geometry"]["location"]
+                    new_place = {
+                        "name": place_name,
+                        "lat": loc["lat"],
+                        "lon": loc["lng"],
+                        "rating": None,
+                        "address": place_address,
+                        "category": place_category,
                     }
-                )
+                    st.session_state["user_places"].append(new_place)
+                    st.success("나만의 장소가 지도에 추가되었습니다!")
+                else:
+                    st.error("지오코딩에 실패했습니다. 주소를 다시 확인해주세요.")
+            except Exception as e:
+                st.error(f"지오코딩 에러: {e}")
 
-    # --------------------------
-    # 지도 생성
-    # --------------------------
-    berlin_center = [52.5200, 13.4050]
-    fmap = folium.Map(location=berlin_center, zoom_start=12)
+    user_places_df = pd.DataFrame(st.session_state["user_places"])
 
-    # 음식점 마커 (파란색)
-    if not restaurants.empty:
-        for _, row in restaurants.iterrows():
-            folium.Marker(
-                [row["lat"], row["lng"]],
-                popup=f"{row['name']} ⭐{row.get('rating', '')}",
-                icon=folium.Icon(color="blue", icon="cutlery", prefix="fa"),
-            ).add_to(fmap)
+    # -----------------------------
+    # 3) 범죄 데이터 준비 (히트맵용)
+    # -----------------------------
+    crime_df = load_and_prepare_crime_data()
 
-    # 호텔 마커 (초록색)
-    if not hotels.empty:
-        for _, row in hotels.iterrows():
-            folium.Marker(
-                [row["lat"], row["lng"]],
-                popup=f"{row['name']} ⭐{row.get('rating', '')}",
-                icon=folium.Icon(color="green", icon="bed", prefix="fa"),
-            ).add_to(fmap)
+    with st.expander("범죄 데이터 미리보기"):
+        st.write(crime_df.head())
 
-    # 관광지 마커 (보라색)
-    if not attractions.empty:
-        for _, row in attractions.iterrows():
-            folium.Marker(
-                [row["lat"], row["lng"]],
-                popup=f"{row['name']} ⭐{row.get('rating', '')}",
-                icon=folium.Icon(color="purple", icon="info-sign"),
-            ).add_to(fmap)
+    # -----------------------------
+    # 4) pydeck 레이어 구성
+    # -----------------------------
+    layers = []
 
-    # 커스텀 장소 마커 (빨간색)
-    for place in st.session_state["custom_places"]:
-        folium.Marker(
-            [place["lat"], place["lng"]],
-            popup=f"⭐ {place['name']} (사용자 추가)",
-            icon=folium.Icon(color="red", icon="star"),
-        ).add_to(fmap)
+    # 음식점 레이어
+    if show_restaurants and not df_rest.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=df_rest,
+                get_position=["lon", "lat"],
+                get_radius=50,
+                get_fill_color=[0, 0, 255, 160],  # 파란색
+                pickable=True,
+            )
+        )
 
-    # 범죄 Heatmap
-    if show_crime:
-        add_crime_heatmap(fmap, crime_df)
+    # 숙박시설 레이어
+    if show_hotels and not df_hotels.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=df_hotels,
+                get_position=["lon", "lat"],
+                get_radius=60,
+                get_fill_color=[255, 165, 0, 160],  # 주황색
+                pickable=True,
+            )
+        )
 
-    # --------------------------
-    # 지도 화면에 표시
-    # --------------------------
-    st.subheader("🗺️ 지도")
-    st_data = st_folium(fmap, width=900, height=600)
+    # 관광지 레이어
+    if show_attractions and not df_attr.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=df_attr,
+                get_position=["lon", "lat"],
+                get_radius=70,
+                get_fill_color=[0, 255, 255, 160],  # 청록색
+                pickable=True,
+            )
+        )
 
+    # 유저 추가 장소 레이어
+    if not user_places_df.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=user_places_df,
+                get_position=["lon", "lat"],
+                get_radius=80,
+                get_fill_color=[255, 0, 255, 200],  # 보라색
+                pickable=True,
+            )
+        )
 
-if __name__ == "__main__":
-    main()
+    # 🔥 범죄 히트맵 레이어 (HeatmapLayer)
+    if show_crime and not crime_df.empty:
+        layers.append(
+            pdk.Layer(
+                "HeatmapLayer",
+                data=crime_df,
+                get_position=["lon", "lat"],
+                get_weight="crime_total",   # 또는 "risk_norm"
+                radiusPixels=60,            # 값 키워가면서 느낌 보기
+            )
+        )
+
+    # 뷰 설정
+    view_state = pdk.ViewState(
+        latitude=BERLIN_CENTER["lat"],
+        longitude=BERLIN_CENTER["lon"],
+        zoom=11,
+        pitch=45,
+    )
+
+    tooltip = {
+        "html": "<b>{name}</b><br/>{address}",
+        "style": {"backgroundColor": "steelblue", "color": "white"},
+    }
+
+    st.markdown("### 3) 지도")
+
+    st.pydeck_chart(
+        pdk.Deck(
+            initial_view_state=view_state,
+            layers=layers,
+            tooltip=tooltip,
+        )
+    )
