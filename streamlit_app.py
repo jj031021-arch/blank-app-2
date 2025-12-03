@@ -1,6 +1,6 @@
-import streamlit as st
-
-st.title("🎈 My new app")
-st.write(
-    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
-)
+cd "berlin-trip-map"
+git init
+git remote add origin https://github.com/내아이디/berlin-trip-map.git
+git add .
+git commit -m "first upload"
+git push -u origin main
