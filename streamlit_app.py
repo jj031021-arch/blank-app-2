@@ -9,9 +9,19 @@ import time
 # -----------------------------
 st.set_page_config(page_title="Berlin Trip Planner", layout="wide")
 
-GOOGLE_API_KEY = st.secrets["GOOGLE_MAPS_API_KEY"]
+# 👉 Streamlit Cloud 의 Secrets에서 가져오기
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY")
 FX_API_BASE_URL = st.secrets.get("FX_API_BASE_URL", "https://api.frankfurter.app/latest")
 HOME_CURRENCY = st.secrets.get("HOME_CURRENCY", "KRW")
+
+# 키 없으면 바로 안내하고 종료
+if not GOOGLE_API_KEY:
+    st.error(
+        "GOOGLE_MAPS_API_KEY 가 설정되어 있지 않습니다.\n\n"
+        "Streamlit Cloud에서 앱 상단의 ▸ Manage app → Settings → Secrets 에서\n"
+        'GOOGLE_MAPS_API_KEY = "본인_키" 를 추가해 주세요.'
+    )
+    st.stop()
 
 BERLIN_CENTER = {"lat": 52.5200, "lon": 13.4050}
 
@@ -37,9 +47,8 @@ def get_exchange_rate(base="EUR", target=HOME_CURRENCY):
 @st.cache_data(show_spinner=False)
 def get_weather_berlin():
     """
-    Google Maps Weather API - currentConditions 사용해서
-    베를린 현재 날씨 가져오기.
-    https://weather.googleapis.com/v1/currentConditions:lookup 
+    Google Maps Weather API - currentConditions.lookup 사용.
+    참고: https://weather.googleapis.com/v1/currentConditions:lookup 
     """
     try:
         url = "https://weather.googleapis.com/v1/currentConditions:lookup"
@@ -47,17 +56,16 @@ def get_weather_berlin():
             "key": GOOGLE_API_KEY,
             "location.latitude": BERLIN_CENTER["lat"],
             "location.longitude": BERLIN_CENTER["lon"],
-            "unitsSystem": "METRIC",  # 섭씨 기준
+            "unitsSystem": "METRIC",
+            "languageCode": "en",
         }
         res = requests.get(url, params=params)
         res.raise_for_status()
         data = res.json()
-        # currentConditions 객체 하나가 온다고 가정
-        current = data.get("currentConditions", {})
-        return current, data  # 요약용 + 원본 JSON 같이 반환
+        return data
     except Exception as e:
         st.error(f"날씨 API 에러: {e}")
-        return None, None
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -67,10 +75,7 @@ def google_places_text_search(query, api_key=GOOGLE_API_KEY):
     query 예: 'restaurants in Berlin, Germany'
     """
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {
-        "query": query,
-        "key": api_key,
-    }
+    params = {"query": query, "key": api_key}
     all_results = []
 
     while True:
@@ -84,7 +89,7 @@ def google_places_text_search(query, api_key=GOOGLE_API_KEY):
         if not next_token:
             break
 
-        # 다음 페이지 토큰 활성화까지 약간 딜레이 필요
+        # 다음 페이지 토큰 사용을 위해 약간 대기
         time.sleep(2)
         params = {"pagetoken": next_token, "key": api_key}
 
@@ -198,27 +203,36 @@ if page == "환율 & 날씨":
     # 날씨 (Google Weather API)
     st.subheader("베를린 현재 날씨 (Google Weather API)")
 
-    weather, weather_raw = get_weather_berlin()
-    if weather:
-        # temperature, apparentTemperature, relativeHumidity 정도만 사용
-        temp = weather.get("temperature")
-        feels = weather.get("apparentTemperature")
-        humidity = weather.get("relativeHumidity")
-        # 설명 텍스트 필드는 실제 응답 구조 보고 조정 필요
-        # (conditionCode, weatherCondition 등)
-        condition_code = weather.get("weatherCondition", {}).get("text") \
-            if isinstance(weather.get("weatherCondition"), dict) else None
+    data = get_weather_berlin()
+    if data:
+        # temperature / feelsLikeTemperature 는 Temperature 객체 (unit, degrees) 
+        temp_obj = data.get("temperature", {})
+        feels_obj = data.get("feelsLikeTemperature", {})
+        humidity = data.get("relativeHumidity")
+        condition_obj = data.get("weatherCondition", {})
 
-        if condition_code:
-            st.write(f"날씨: **{condition_code}**")
-        st.write(f"현재 기온: **{temp}°C**")
+        temp = temp_obj.get("degrees")
+        feels = feels_obj.get("degrees")
+        cond_text = None
+
+        # WeatherCondition 안에 text 형태의 필드가 있을 수 있음 (지역/버전에 따라 다를 수 있어, 안전하게 처리)
+        for key in ["description", "text", "summary"]:
+            if isinstance(condition_obj, dict) and key in condition_obj:
+                cond_text = condition_obj[key]
+                break
+
+        if cond_text:
+            st.write(f"날씨: **{cond_text}**")
+
+        if temp is not None:
+            st.write(f"현재 기온: **{temp:.1f}°C**")
         if feels is not None:
-            st.write(f"체감 기온: **{feels}°C**")
+            st.write(f"체감 기온: **{feels:.1f}°C**")
         if humidity is not None:
             st.write(f"습도: **{humidity}%**")
 
         with st.expander("원시 날씨 JSON 보기 (필드 구조 확인용)"):
-            st.json(weather_raw)
+            st.json(data)
     else:
         st.write("날씨 정보를 불러올 수 없습니다 😢")
 
@@ -284,10 +298,7 @@ else:
         if submitted and place_name and place_address:
             try:
                 url = "https://maps.googleapis.com/maps/api/geocode/json"
-                params = {
-                    "address": place_address,
-                    "key": GOOGLE_API_KEY,
-                }
+                params = {"address": place_address, "key": GOOGLE_API_KEY}
                 res = requests.get(url, params=params)
                 res.raise_for_status()
                 data = res.json()
